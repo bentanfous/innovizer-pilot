@@ -1,4 +1,4 @@
-# Innovizer Pilot v0.1
+# Innovizer Pilot v0.2
 
 Fusion exécutable des batches Claude : **Brique 01 Data/Evidence + screening projets + Brique 03 Eva**.
 

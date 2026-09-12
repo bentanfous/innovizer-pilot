@@ -1,4 +1,4 @@
-# Innovizer Pilot v0.1 — Déploiement Railway
+# Innovizer Pilot v0.2 — Déploiement Railway
 
 ## 1. Mettre ce dossier dans GitHub
 Créez un nouveau repository GitHub vide, puis chargez **le contenu de ce dossier** à la racine du repository.
