@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 import pandas as pd
 
 from innovizer.engines import fiche_projet as fp
+from innovizer import config as dossier_config
+from innovizer.raw_builder import build as build_raw
 from innovizer.brique03.interview import Entretien
 from innovizer.brique03.runtime import Store
 
@@ -14,6 +16,9 @@ ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web" / "index.html"
 UPLOAD_DIR = Path(os.getenv("INNOVIZER_UPLOAD_DIR", ROOT / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RAW_DIR = Path(os.getenv("INNOVIZER_RAW_DIR", ROOT / "raw_uploads"))
+for _k in ["payroll","payslips","timesheets","cvs","diplomas","ledger","invoices","assets"]: (RAW_DIR/_k).mkdir(parents=True, exist_ok=True)
+RAW_META = RAW_DIR / "metadata.json"
 STORE = Store(ROOT / "data" / "entretiens")
 SESSIONS: dict[str, Entretien] = {}
 
@@ -72,7 +77,7 @@ def dataset_status():
             k: {"uploaded": p.exists(), "name": meta.get(k, {}).get("name"), "size": p.stat().st_size if p.exists() else 0}
             for k, p in FILES.items()
         },
-        "storage_note": "Les fichiers du pilote sont stockés sur le filesystem Railway et peuvent être perdus lors d'un redeploy. Ajouter un Railway Volume avant une utilisation production."
+        "storage_note": "Les fichiers bruts du pilote sont stockés sur le filesystem Railway. Ajoute un Railway Volume avant toute utilisation durable ou réelle."
     }
 
 
@@ -172,6 +177,27 @@ def validate_xlsx(kind: str, path: Path):
     return True, None
 
 
+
+def raw_meta():
+    if RAW_META.exists():
+        try: return json.loads(RAW_META.read_text(encoding="utf-8"))
+        except Exception: return {}
+    return {}
+
+def raw_status():
+    meta=raw_meta(); groups={}
+    for k in ["payroll","payslips","timesheets","cvs","diplomas","ledger","invoices","assets"]:
+        fs=[x for x in (RAW_DIR/k).iterdir() if x.is_file() and x.name != ".gitkeep"]
+        groups[k]={"count":len(fs),"files":[x.name for x in fs]}
+    return {"groups":groups,"build_ready":groups["payroll"]["count"]>0 and groups["payslips"]["count"]>0 and groups["timesheets"]["count"]>0,"dataset_ready":FILES["brique01"].exists(),"last_build":meta.get("last_build"),"config":meta.get("config",{"client":"","exercice":2025,"heures_par_jour":7.8})}
+
+def save_raw_meta(d):
+    RAW_META.write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding="utf-8")
+
+def safe_filename(name):
+    name=Path(name or "upload.bin").name
+    return re.sub(r"[^A-Za-z0-9._ -]","_",name)[:180]
+
 class H(BaseHTTPRequestHandler):
     def _send(self, code, obj, ctype="application/json; charset=utf-8"):
         if isinstance(obj, (dict, list)):
@@ -195,7 +221,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"): return self._send(200, WEB.read_bytes(), "text/html; charset=utf-8")
-        if path == "/api/health": return self._send(200, {"ok": True, "version": "0.3.0", "dataset": dataset_status()})
+        if path == "/api/health": return self._send(200, {"ok": True, "version": "0.4.0", "dataset": dataset_status(), "raw": raw_status()})
+        if path == "/api/raw/status": return self._send(200, raw_status())
         if path == "/api/dataset/status": return self._send(200, dataset_status())
         try:
             if path == "/api/datahub/summary": return self._send(200, datahub_summary())
@@ -217,6 +244,28 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path.startswith("/api/raw/upload/"):
+            kind=path.rsplit("/",1)[-1]
+            allowed={"payroll","payslips","timesheets","cvs","diplomas","ledger","invoices","assets"}
+            if kind not in allowed: return self._send(400,{"error":"type d\'import inconnu"})
+            n=int(self.headers.get("Content-Length",0)); name=safe_filename(self.headers.get("X-Filename","upload.bin"))
+            if n<=0: return self._send(400,{"error":"fichier vide"})
+            ext=Path(name).suffix.lower()
+            expected={"payroll":{".xlsx",".xlsm"},"payslips":{".pdf"},"timesheets":{".xlsx",".xlsm"},"cvs":{".pdf"},"diplomas":{".pdf"},"ledger":{".xlsx",".xlsm",".xls",".csv"},"invoices":{".pdf"},"assets":{".xlsx",".xlsm",".xls",".csv"}}
+            if ext not in expected[kind]: return self._send(400,{"error":f"format {ext or 'sans extension'} non accepté pour {kind}"})
+            dest=RAW_DIR/kind/name; dest.write_bytes(self.rfile.read(n))
+            return self._send(201,{"ok":True,"kind":kind,"file":name,"raw":raw_status()})
+        if path == "/api/raw/config":
+            d=self._body(); meta=raw_meta(); meta["config"]={"client":str(d.get("client") or "CLIENT PILOTE"),"exercice":int(d.get("exercice") or 2025),"heures_par_jour":float(d.get("heures_par_jour") or 7.8)}; save_raw_meta(meta)
+            return self._send(200,{"ok":True,"raw":raw_status()})
+        if path == "/api/raw/build":
+            try:
+                st=raw_status(); c=st["config"]; dos=dossier_config.Dossier(client=c.get("client") or "CLIENT PILOTE",exercice=int(c.get("exercice") or 2025),heures_par_jour=float(c.get("heures_par_jour") or 7.8))
+                res=build_raw(RAW_DIR,FILES["brique01"],dos,UPLOAD_DIR/".cache")
+                meta=raw_meta(); meta["last_build"]=res; save_raw_meta(meta); SESSIONS.clear()
+                return self._send(201,{"ok":True,"result":res,"dataset":dataset_status(),"raw":raw_status()})
+            except Exception as e:
+                return self._send(422,{"error":str(e),"raw":raw_status()})
         if path.startswith("/api/uploads/"):
             kind = path.rstrip('/').split('/')[-1]
             if kind not in FILES: return self._send(404, {"error": "type d'import inconnu"})
@@ -259,6 +308,15 @@ class H(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
+        if path == "/api/raw":
+            import shutil
+            for k in ["payroll","payslips","timesheets","cvs","diplomas","ledger","invoices","assets"]:
+                for f in (RAW_DIR/k).iterdir():
+                    if f.is_file() and f.name != ".gitkeep": f.unlink(missing_ok=True)
+            RAW_META.unlink(missing_ok=True)
+            for p in FILES.values(): p.unlink(missing_ok=True)
+            META.unlink(missing_ok=True); SESSIONS.clear()
+            return self._send(200,{"ok":True,"raw":raw_status(),"dataset":dataset_status()})
         if path == "/api/dataset":
             for p in FILES.values(): p.unlink(missing_ok=True)
             META.unlink(missing_ok=True); SESSIONS.clear()
@@ -270,7 +328,7 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.getenv("PORT", "3010"))
-    print(f"Innovizer Pilot v0.3 → http://localhost:{port}")
+    print(f"Innovizer Pilot v0.4 → http://localhost:{port}")
     ThreadingHTTPServer(("", port), H).serve_forever()
 
 if __name__ == "__main__": main()
